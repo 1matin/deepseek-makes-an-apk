@@ -9,10 +9,9 @@ from kivy.storage.jsonstore import JsonStore
 from kivy.utils import platform
 from plyer import sms as plyer_sms
 import time
-import threading
 
 if platform == 'android':
-    from jnius import autoclass, cast
+    from jnius import autoclass
     from android import mActivity
     from android.broadcast import BroadcastReceiver
 
@@ -20,8 +19,6 @@ if platform == 'android':
     Intent = autoclass('android.content.Intent')
     IntentFilter = autoclass('android.content.IntentFilter')
     Uri = autoclass('android.net.Uri')
-    ContentValues = autoclass('android.content.ContentValues')
-    Calendar = autoclass('java.util.Calendar')
 
 class ChatApp(App):
     number_file = 'target_number.json'
@@ -31,14 +28,15 @@ class ChatApp(App):
         self.store = JsonStore(self.number_file)
         self.msg_store = JsonStore(self.messages_store_file)
 
-        # Load saved phone number
+        # Load saved numbers
         self.target_number = self.store.get('number') if self.store.exists('number') else None
+        self.medium_number = self.store.get('medium_number') if self.store.exists('medium_number') else None
 
         root = BoxLayout(orientation='vertical', padding=10, spacing=10)
 
-        # Phone number field (persistent)
+        # --- Target number field ---
         self.number_input = TextInput(
-            hint_text='Enter phone number',
+            hint_text='Enter target phone number',
             text=self.target_number if self.target_number else '',
             multiline=False,
             size_hint=(1, None),
@@ -46,13 +44,26 @@ class ChatApp(App):
         )
         root.add_widget(self.number_input)
 
-        # Save button for number
-        save_btn = Button(text='Save Number', size_hint=(1, None), height=40)
-        save_btn.bind(on_press=self.save_number)
-        root.add_widget(save_btn)
+        save_target_btn = Button(text='Save Target', size_hint=(1, None), height=40)
+        save_target_btn.bind(on_press=self.save_target_number)
+        root.add_widget(save_target_btn)
 
-        # Chat display (IRC‑like scrollable)
-        self.scroll = ScrollView(size_hint=(1, 0.7))
+        # --- Medium number field (NEW) ---
+        self.medium_input = TextInput(
+            hint_text='Enter medium proxy number',
+            text=self.medium_number if self.medium_number else '',
+            multiline=False,
+            size_hint=(1, None),
+            height=50
+        )
+        root.add_widget(self.medium_input)
+
+        save_medium_btn = Button(text='Save Medium', size_hint=(1, None), height=40)
+        save_medium_btn.bind(on_press=self.save_medium_number)
+        root.add_widget(save_medium_btn)
+
+        # Chat display (IRC‑like, scrollable)
+        self.scroll = ScrollView(size_hint=(1, 0.6))
         self.chat_label = Label(
             text='',
             size_hint_y=None,
@@ -73,13 +84,11 @@ class ChatApp(App):
         bottom.add_widget(send_btn)
         root.add_widget(bottom)
 
-        # Load existing messages and display
+        # Load existing messages
         self.refresh_chat()
 
         if platform == 'android':
-            # Request SMS permissions at startup
             self.request_sms_permissions()
-            # Start the background SMS listener service
             self.start_sms_service()
 
         return root
@@ -90,15 +99,21 @@ class ChatApp(App):
         if self.scroll.scroll_y != 0:
             self.scroll.scroll_y = 0
 
-    def save_number(self, instance):
+    def save_target_number(self, instance):
         number = self.number_input.text.strip()
         if number:
             self.target_number = number
             self.store.put('number', number=number)
             self.refresh_chat()
 
+    def save_medium_number(self, instance):
+        number = self.medium_input.text.strip()
+        if number:
+            self.medium_number = number
+            self.store.put('medium_number', medium_number=number)
+
     def refresh_chat(self):
-        """Reload chat messages from JSON store for current number."""
+        """Reload chat messages for the current target number."""
         self.chat_label.text = ''
         if not self.target_number:
             return
@@ -118,15 +133,14 @@ class ChatApp(App):
             self.chat_label.text = '\n'.join(lines)
 
     def send_message(self, instance):
+        """Send an SMS to the target number (the chat partner)."""
         if not self.target_number:
             return
         text = self.msg_input.text.strip()
         if not text:
             return
-        # Send SMS via Plyer (requires SEND_SMS permission)
         try:
             plyer_sms.send(recipient=self.target_number, message=text)
-            # Save outgoing message locally
             self._store_message('me', text)
             self.msg_input.text = ''
             self.refresh_chat()
@@ -134,7 +148,6 @@ class ChatApp(App):
             self.chat_label.text += f'\n[color=ff0000]Send failed: {e}[/color]'
 
     def _store_message(self, sender, body, timestamp=None):
-        """Save a message to JSON under the target number."""
         if not self.target_number:
             return
         key = self.target_number
@@ -149,7 +162,6 @@ class ChatApp(App):
         self.msg_store.put(key, messages=messages)
 
     def request_sms_permissions(self):
-        """Request necessary SMS permissions on Android (API 23+)."""
         if platform != 'android':
             return
         from android.permissions import request_permissions, Permission
@@ -161,24 +173,20 @@ class ChatApp(App):
         ])
 
     def start_sms_service(self):
-        """Start a background service that listens for incoming SMS."""
         if platform != 'android':
             return
         try:
             service = PythonService.mService
             if not service:
                 PythonService.start(mActivity, 'SmsListenerService')
-                # The service class is defined below; Buildozer will load it.
         except Exception as e:
             print(f'Could not start SMS listener: {e}')
 
     def on_stop(self):
-        # The service continues running in the background.
         pass
 
 
 class SmsListenerService(PythonService):
-    """Android service that continuously listens for incoming SMS."""
     SMS_RECEIVED_ACTION = 'android.provider.Telephony.SMS_RECEIVED'
 
     def __init__(self):
@@ -198,59 +206,74 @@ class SmsListenerService(PythonService):
 
 
 class _SmsBroadcastReceiver(BroadcastReceiver):
-    """Handles the actual SMS_RECEIVED intent."""
     def __init__(self, service):
         super().__init__()
         self.service = service
 
     def onReceive(self, context, intent):
-        # Called in a worker thread; we schedule processing on the main thread
         Clock.schedule_once(lambda dt: self.process_sms(intent))
 
     def process_sms(self, intent):
-        # Get the app instance
         app = App.get_running_app()
-        if not app or not app.target_number:
+        if not app:
             return
+
         target = app.target_number
-        # Extract SMS messages from intent
-        messages = []
-        if intent.getAction() == SmsListenerService.SMS_RECEIVED_ACTION:
-            # Use Telephony.Sms.Intents to parse
-            SmsMessage = autoclass('android.telephony.SmsMessage')
-            pdu_array = intent.getSerializableExtra('pdus')
-            if pdu_array:
-                for pdu in pdu_array:
-                    pdu_bytes = bytes(pdu) if hasattr(pdu, '__bytes__') else pdu
-                    sms = SmsMessage.createFromPdu(pdu_bytes)
-                    sender = sms.getOriginatingAddress()
-                    body = sms.getMessageBody()
-                    timestamp = sms.getTimestampMillis()
-                    if sender == target:
-                        messages.append((sender, body, timestamp))
-        # Save and schedule deletion
-        for sender, body, ts in messages:
-            # Save to our storage
-            app._store_message(sender, body, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts / 1000)))
-            # Schedule deletion from main SMS database after 1 minute
-            Clock.schedule_once(lambda dt, t=ts: schedule_deletion(t), 60)
-        app.refresh_chat()
+        medium = app.medium_number
 
+        if intent.getAction() != SmsListenerService.SMS_RECEIVED_ACTION:
+            return
 
-def schedule_deletion(timestamp):
-    """Delete the SMS from the system SMS provider after the timeout."""
-    if platform != 'android':
-        return
-    try:
-        # Access content resolver
-        resolver = mActivity.getContentResolver()
-        SMS_URI = Uri.parse('content://sms')
-        # Delete where date = timestamp (crude but works for this simple demo)
-        selection = 'date = ?'
-        args = [str(timestamp)]
-        resolver.delete(SMS_URI, selection, args)
-    except Exception as e:
-        print(f'Deletion failed: {e}')
+        SmsMessage = autoclass('android.telephony.SmsMessage')
+        pdu_array = intent.getSerializableExtra('pdus')
+        if not pdu_array:
+            return
+
+        for pdu in pdu_array:
+            pdu_bytes = bytes(pdu) if hasattr(pdu, '__bytes__') else pdu
+            sms = SmsMessage.createFromPdu(pdu_bytes)
+            sender = sms.getOriginatingAddress()
+            body = sms.getMessageBody()
+            timestamp = sms.getTimestampMillis()
+            ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp / 1000))
+
+            # 1. Message from the target number
+            if target and sender == target:
+                # Save to chat
+                app._store_message(sender, body, ts_str)
+                # Schedule deletion from system SMS inbox after 1 minute
+                Clock.schedule_once(lambda dt, t=timestamp: self.schedule_deletion(t), 60)
+                app.refresh_chat()
+
+                # Forward to medium number
+                if medium:
+                    Clock.schedule_once(lambda dt, msg=body: self._safe_send(medium, msg))
+
+            # 2. Message from the medium number → forward to target (proxy)
+            elif medium and sender == medium:
+                if target:
+                    Clock.schedule_once(lambda dt, msg=body: self._safe_send(target, msg))
+                # Do NOT store in the conversation – purely proxy pass-through
+
+    def _safe_send(self, recipient, message):
+        """Send an SMS from the main thread, catching any errors."""
+        try:
+            plyer_sms.send(recipient=recipient, message=message)
+        except Exception as e:
+            print(f'Forwarding SMS failed: {e}')
+
+    def schedule_deletion(self, timestamp):
+        """Delete the SMS from the system database after the timeout."""
+        if platform != 'android':
+            return
+        try:
+            resolver = mActivity.getContentResolver()
+            SMS_URI = Uri.parse('content://sms')
+            selection = 'date = ?'
+            args = [str(timestamp)]
+            resolver.delete(SMS_URI, selection, args)
+        except Exception as e:
+            print(f'Deletion failed: {e}')
 
 
 if __name__ == '__main__':
