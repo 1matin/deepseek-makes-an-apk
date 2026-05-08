@@ -48,7 +48,7 @@ class ChatApp(App):
         save_target_btn.bind(on_press=self.save_target_number)
         root.add_widget(save_target_btn)
 
-        # --- Medium number field (NEW) ---
+        # --- Medium number field ---
         self.medium_input = TextInput(
             hint_text='Enter medium proxy number',
             text=self.medium_number if self.medium_number else '',
@@ -95,7 +95,6 @@ class ChatApp(App):
 
     def _update_chat_height(self, instance, value):
         self.chat_label.height = value[1]
-        # Auto-scroll to bottom
         if self.scroll.scroll_y != 0:
             self.scroll.scroll_y = 0
 
@@ -113,7 +112,6 @@ class ChatApp(App):
             self.store.put('medium_number', medium_number=number)
 
     def refresh_chat(self):
-        """Reload chat messages for the current target number."""
         self.chat_label.text = ''
         if not self.target_number:
             return
@@ -133,17 +131,22 @@ class ChatApp(App):
             self.chat_label.text = '\n'.join(lines)
 
     def send_message(self, instance):
-        """Send an SMS to the target number (the chat partner)."""
+        """Send an SMS to the target number and schedule its removal."""
         if not self.target_number:
             return
         text = self.msg_input.text.strip()
         if not text:
             return
+        send_time = int(time.time() * 1000)           # timestamp for later deletion
         try:
             plyer_sms.send(recipient=self.target_number, message=text)
             self._store_message('me', text)
             self.msg_input.text = ''
             self.refresh_chat()
+            # Schedule deletion of this outgoing SMS from the Sent folder
+            Clock.schedule_once(
+                lambda dt, ts=send_time: self._delete_sms_by_time(ts, 'sent'), 60
+            )
         except Exception as e:
             self.chat_label.text += f'\n[color=ff0000]Send failed: {e}[/color]'
 
@@ -184,6 +187,20 @@ class ChatApp(App):
 
     def on_stop(self):
         pass
+
+    @staticmethod
+    def _delete_sms_by_time(timestamp, folder='inbox'):
+        """Delete an SMS from the given folder (inbox/sent) using the date field."""
+        if platform != 'android':
+            return
+        try:
+            resolver = mActivity.getContentResolver()
+            uri = Uri.parse(f'content://sms/{folder}')
+            selection = 'date = ?'
+            args = [str(timestamp)]
+            resolver.delete(uri, selection, args)
+        except Exception as e:
+            print(f'Deletion failed from {folder}: {e}')
 
 
 class SmsListenerService(PythonService):
@@ -237,43 +254,32 @@ class _SmsBroadcastReceiver(BroadcastReceiver):
             timestamp = sms.getTimestampMillis()
             ts_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp / 1000))
 
-            # 1. Message from the target number
+            # 1. Incoming from target → save, delete from inbox, forward to medium
             if target and sender == target:
-                # Save to chat
                 app._store_message(sender, body, ts_str)
-                # Schedule deletion from system SMS inbox after 1 minute
-                Clock.schedule_once(lambda dt, t=timestamp: self.schedule_deletion(t), 60)
+                Clock.schedule_once(
+                    lambda dt, ts=timestamp: ChatApp._delete_sms_by_time(ts, 'inbox'), 60
+                )
                 app.refresh_chat()
 
-                # Forward to medium number
                 if medium:
-                    Clock.schedule_once(lambda dt, msg=body: self._safe_send(medium, msg))
+                    self._forward_and_delete(medium, body)
 
-            # 2. Message from the medium number → forward to target (proxy)
+            # 2. Incoming from medium → forward to target (proxy) & delete outgoing copy
             elif medium and sender == medium:
                 if target:
-                    Clock.schedule_once(lambda dt, msg=body: self._safe_send(target, msg))
-                # Do NOT store in the conversation – purely proxy pass-through
+                    self._forward_and_delete(target, body)
 
-    def _safe_send(self, recipient, message):
-        """Send an SMS from the main thread, catching any errors."""
+    def _forward_and_delete(self, recipient, message):
+        """Send an SMS to `recipient` and schedule its removal from Sent folder."""
+        send_time = int(time.time() * 1000)
         try:
             plyer_sms.send(recipient=recipient, message=message)
+            Clock.schedule_once(
+                lambda dt, ts=send_time: ChatApp._delete_sms_by_time(ts, 'sent'), 60
+            )
         except Exception as e:
             print(f'Forwarding SMS failed: {e}')
-
-    def schedule_deletion(self, timestamp):
-        """Delete the SMS from the system database after the timeout."""
-        if platform != 'android':
-            return
-        try:
-            resolver = mActivity.getContentResolver()
-            SMS_URI = Uri.parse('content://sms')
-            selection = 'date = ?'
-            args = [str(timestamp)]
-            resolver.delete(SMS_URI, selection, args)
-        except Exception as e:
-            print(f'Deletion failed: {e}')
 
 
 if __name__ == '__main__':
