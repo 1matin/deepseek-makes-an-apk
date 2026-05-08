@@ -36,6 +36,7 @@ jobs:
           'android.minapi = 21' \
           'android.ndk = 23b' \
           'android.services = SmsListenerService:app/main.py' \
+          'android.accept_sdk_license = True' \
           'p4a.branch = develop' \
           > buildozer.spec
 
