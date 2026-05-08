@@ -37,8 +37,12 @@ jobs:
           'android.ndk = 25c' \
           'android.services = SmsListenerService:app/main.py' \
           'android.accept_sdk_license = True' \
-          'p4a.branch = develop' \
+          'p4a.branch = master' \
           > buildozer.spec
+
+    - name: Clean cached Python-for-Android
+      run: |
+        rm -rf ./.buildozer/android/platform/python-for-android || true
 
     - name: Build APK
       run: buildozer -v android debug
